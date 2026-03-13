@@ -1,0 +1,25 @@
+# API
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.10.0
+
+# Database
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.10
+
+# Cache / queue
+redis>=5.2.0
+
+# AI
+anthropic>=0.42.0
+voyageai>=0.3.0
+
+# Vector store (pgvector SQLAlchemy integration)
+pgvector>=0.3.0
+
+# Telegram bot
+python-telegram-bot[ext]>=21.0
+httpx>=0.28.0
+
+# Config
+python-dotenv>=1.0.0

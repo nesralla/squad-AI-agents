@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs grep:*)",
+      "Bash(grep -r \"webhook\\\\|callback\\\\|polling\\\\|listener\" --include=*.py .)",
+      "Bash(curl -s http://localhost:8000/jira/status)",
+      "Bash(curl -s -X POST http://localhost:8000/jira/sync)",
+      "Bash(curl -s -X POST http://localhost:8000/tasks -H \"Content-Type: application/json\" -d '{\"\"description\"\": \"\"[DEV-42] Criar endpoint de health check em Go\"\", \"\"jira_issue_key\"\": \"\"DEV-42\"\", \"\"jira_issue_url\"\": \"\"https://test.atlassian.net/browse/DEV-42\"\", \"\"jira_project_key\"\": \"\"DEV\"\"}')",
+      "Bash(curl -s http://localhost:8000/tasks/4)"
+    ]
+  }
+}

@@ -1,0 +1,20 @@
+FROM golang:1.22-bookworm AS go-base
+
+FROM python:3.12-slim-bookworm
+
+# Copy the Go toolchain from the official Go image
+COPY --from=go-base /usr/local/go /usr/local/go
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+# git is required by GitService (clone, commit, push)
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "-m", "worker.main"]

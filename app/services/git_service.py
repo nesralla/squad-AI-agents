@@ -1,0 +1,217 @@
+import logging
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import httpx
+
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class GitService:
+    def __init__(self):
+        self.repo_path = Path(settings.GIT_REPO_PATH)
+        self.repo_url = settings.GIT_REPO_URL
+        self.main_branch = settings.GIT_MAIN_BRANCH
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _git(self, *args: str, cwd: Path | None = None) -> str:
+        cwd = cwd or self.repo_path
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git {' '.join(args)} failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+            )
+        return result.stdout.strip()
+
+    def _git_ok(self, *args: str, cwd: Path | None = None) -> bool:
+        """Run a git command and return True if it succeeded (no exception)."""
+        cwd = cwd or self.repo_path
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+
+    def _authenticated_url(self) -> str:
+        url = self.repo_url
+        token = settings.GIT_TOKEN
+        if token and url.startswith("https://"):
+            url = url.replace("https://", f"https://{token}@", 1)
+        return url
+
+    def _is_healthy_repo(self) -> bool:
+        """Check if the repo directory contains a valid, functional git repo."""
+        git_dir = self.repo_path / ".git"
+        if not git_dir.exists():
+            return False
+        # Verify git can actually read the repo
+        return self._git_ok("rev-parse", "--is-inside-work-tree")
+
+    def _nuke_and_clone(self) -> None:
+        """Delete everything in the repo directory and do a fresh clone."""
+        if self.repo_path.exists():
+            logger.warning(f"Removing corrupt/stale repo at {self.repo_path}")
+            shutil.rmtree(self.repo_path, ignore_errors=True)
+
+        self.repo_path.mkdir(parents=True, exist_ok=True)
+        auth_url = self._authenticated_url()
+        logger.info(f"Cloning fresh repo into {self.repo_path} ...")
+        self._git("clone", auth_url, ".", cwd=self.repo_path)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def setup_repo(self) -> None:
+        """Ensure a clean, healthy clone exists and configure identity."""
+        if not self._is_healthy_repo():
+            self._nuke_and_clone()
+        else:
+            logger.info("Repo present and healthy, reusing existing clone.")
+
+        self._git("config", "user.name", settings.GIT_USERNAME)
+        self._git("config", "user.email", settings.GIT_EMAIL)
+
+    def create_branch(self, task_id: int, task_description: str) -> str:
+        """
+        Reset to the main branch with a clean working tree, then create
+        a new feature branch. Safe to call even if the repo was left
+        on a different branch or has uncommitted changes.
+        """
+        slug = re.sub(r"[^a-z0-9]+", "-", task_description.lower())[:40].strip("-")
+        branch_name = f"feature/task-{task_id}-{slug}"
+
+        # Discard any local changes from previous tasks
+        self._git("checkout", "--force", self.main_branch)
+        self._git("clean", "-fd")                # remove untracked files/dirs
+        self._git("fetch", "origin")
+        self._git("reset", "--hard", f"origin/{self.main_branch}")
+
+        # Delete the local branch if it already exists (retry scenario)
+        if self._git_ok("rev-parse", "--verify", branch_name):
+            self._git("branch", "-D", branch_name)
+
+        self._git("checkout", "-b", branch_name)
+
+        logger.info(f"[Task {task_id}] Branch created: {branch_name}")
+        return branch_name
+
+    def write_files(self, files: list[dict]) -> None:
+        """Write generated files into the repository working tree."""
+        for file_info in files:
+            file_path = self.repo_path / file_info["path"]
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(file_info["content"], encoding="utf-8")
+            logger.info(f"Written: {file_path}")
+
+    def commit_and_push(self, branch_name: str, task_id: int, summary: str) -> None:
+        """Stage all changes, commit and push to remote."""
+        self._git("add", "-A")
+
+        subject = f"feat(ia-agent): task #{task_id} - {summary}"[:72]
+        commit_message = f"{subject}\n\nGenerated by IA Dev Squad (automated commit)"
+
+        self._git("commit", "-m", commit_message)
+        self._git("push", "--force-with-lease", "origin", branch_name)
+        logger.info(f"[Task {task_id}] Pushed branch: {branch_name}")
+
+    def execute_task(
+        self,
+        task_id: int,
+        task_description: str,
+        files: list[dict],
+        summary: str,
+    ) -> str:
+        """Full pipeline: setup -> branch -> write -> commit -> push. Returns branch name."""
+        self.setup_repo()
+        branch_name = self.create_branch(task_id, task_description)
+        self.write_files(files)
+        self.commit_and_push(branch_name, task_id, summary)
+        return branch_name
+
+    # ------------------------------------------------------------------
+    # Pull Request creation via GitHub API
+    # ------------------------------------------------------------------
+
+    def _parse_repo_owner_name(self) -> tuple[str, str]:
+        """Extract owner and repo name from GIT_REPO_URL."""
+        # Handle https://github.com/owner/repo.git
+        match = re.search(r"github\.com[/:]([^/]+)/([^/.]+)", self.repo_url)
+        if not match:
+            raise ValueError(f"Cannot parse GitHub owner/repo from URL: {self.repo_url}")
+        return match.group(1), match.group(2)
+
+    def create_pull_request(
+        self,
+        branch_name: str,
+        title: str,
+        body: str,
+    ) -> dict | None:
+        """
+        Create a Pull Request on GitHub using the REST API.
+
+        Returns the PR dict (with 'html_url', 'number', etc.) or None if creation fails.
+        """
+        token = settings.GIT_TOKEN
+        if not token:
+            logger.warning("GIT_TOKEN not set — skipping PR creation.")
+            return None
+
+        try:
+            owner, repo = self._parse_repo_owner_name()
+        except ValueError as exc:
+            logger.warning(f"PR creation skipped: {exc}")
+            return None
+
+        url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        payload = {
+            "title": title,
+            "body": body,
+            "head": branch_name,
+            "base": self.main_branch,
+        }
+
+        try:
+            resp = httpx.post(url, json=payload, headers=headers, timeout=30.0)
+
+            if resp.status_code == 201:
+                pr_data = resp.json()
+                logger.info(
+                    f"PR created: #{pr_data['number']} — {pr_data['html_url']}"
+                )
+                return pr_data
+
+            # PR may already exist for this branch
+            if resp.status_code == 422:
+                logger.warning(f"PR already exists or validation error: {resp.text[:300]}")
+                return None
+
+            logger.warning(
+                f"GitHub API returned {resp.status_code}: {resp.text[:300]}"
+            )
+            return None
+
+        except Exception as exc:
+            logger.warning(f"PR creation failed: {exc}")
+            return None
