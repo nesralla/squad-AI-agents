@@ -68,9 +68,8 @@ class JiraService:
     def get_new_issues(self) -> list[dict]:
         """
         Fetch issues in the target project that:
+          - Belong to the configured project
           - Have the trigger label (e.g. "ai-squad")
-          - Are in "To Do" status
-          - Are of type Story or Task
 
         Returns a list of simplified issue dicts.
         """
@@ -80,8 +79,6 @@ class JiraService:
         jql = (
             f'project = "{self.project_key}" '
             f'AND labels = "{self.label_trigger}" '
-            f'AND status = "{settings.JIRA_STATUS_TODO}" '
-            f"AND issuetype in (Story, Task, Bug) "
             f"ORDER BY created ASC"
         )
 
