@@ -15,7 +15,7 @@ def get_client() -> anthropic.Anthropic:
 def call_claude(system_prompt: str, user_prompt: str, max_tokens: int = 8000) -> str:
     client = get_client()
     response = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-haiku-4-5-20251001",
         max_tokens=max_tokens,
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
