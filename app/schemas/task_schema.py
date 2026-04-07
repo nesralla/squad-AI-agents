@@ -1,12 +1,12 @@
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.models.task import TaskStatus
 
 
 class TaskRequest(BaseModel):
-    description: str
+    description: str = Field(..., min_length=10, max_length=10000)
     telegram_chat_id: Optional[str] = None
     telegram_message_id: Optional[int] = None
     jira_issue_key: Optional[str] = None

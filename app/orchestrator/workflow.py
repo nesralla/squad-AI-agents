@@ -14,6 +14,7 @@ Pipeline:
 """
 import json
 import logging
+from typing import Callable
 
 from sqlalchemy.orm import Session
 
@@ -48,7 +49,12 @@ class Orchestrator:
         → SecurityAgent → ReviewerAgent → DeployAgent → GitService (push + PR)
     """
 
-    def __init__(self, db: Session):
+    def __init__(
+        self,
+        db: Session,
+        on_agent_complete: Callable[[str], None] | None = None,
+        on_agent_fail: Callable[[str], None] | None = None,
+    ):
         self.planner = PlannerAgent()
         self.architect = ArchitectAgent()
         self.dev = DevAgent()
@@ -59,6 +65,24 @@ class Orchestrator:
         self.git = GitService()
         self.tasks = TaskService(db)
         self.memory = MemoryService(db)
+        self._on_agent_complete = on_agent_complete
+        self._on_agent_fail = on_agent_fail
+
+    def _agent_done(self, step: str) -> None:
+        """Notify that an agent step completed successfully."""
+        if self._on_agent_complete:
+            try:
+                self._on_agent_complete(step)
+            except Exception as exc:
+                logger.warning(f"on_agent_complete callback failed for '{step}': {exc}")
+
+    def _agent_failed(self, step: str) -> None:
+        """Notify that an agent step failed."""
+        if self._on_agent_fail:
+            try:
+                self._on_agent_fail(step)
+            except Exception as exc:
+                logger.warning(f"on_agent_fail callback failed for '{step}': {exc}")
 
     def _progress(self, task_id: int, step: str, detail: str = "") -> None:
         set_progress(task_id, step, detail)
@@ -128,6 +152,7 @@ class Orchestrator:
             f"[Task {task_id}] Plan: {subtask_count} subtask(s), "
             f"complex={is_complex}."
         )
+        self._agent_done("planner")
 
         # ── Architect ──
         self._progress(task_id, "architect", "ArchitectAgent definindo arquitetura...")
@@ -141,6 +166,7 @@ class Orchestrator:
         logger.info(
             f"[Task {task_id}] Architecture: {tech_decisions} tech decisions."
         )
+        self._agent_done("architect")
 
         return plan, architecture
 
@@ -299,6 +325,12 @@ class Orchestrator:
                     f"Pushing best version."
                 )
 
+        self._agent_done("dev_agent")
+        if security_output:
+            self._agent_done("security")
+        if review_output:
+            self._agent_done("reviewer")
+
         return dev_output, build_result, security_output, review_output, iteration
 
     # ------------------------------------------------------------------
@@ -319,6 +351,7 @@ class Orchestrator:
         """
         source_files = dev_output.get("files", [])
         test_output = None
+        test_build_result = None
         tests_pass = False
 
         for test_iter in range(1, MAX_TEST_ITERATIONS + 1):
@@ -371,7 +404,11 @@ class Orchestrator:
 
             except Exception as test_exc:
                 logger.warning(f"[Task {task_id}] TestAgent failed (non-fatal): {test_exc}")
+                self._agent_failed("test_agent")
                 break
+
+        if test_output:
+            self._agent_done("test_agent")
 
         return test_output, tests_pass
 
@@ -475,6 +512,8 @@ class Orchestrator:
                     logger.info(f"[Task {task_id}] PR created: {pr_data.get('html_url')}")
             except Exception as pr_exc:
                 logger.warning(f"[Task {task_id}] PR creation failed (non-fatal): {pr_exc}")
+
+        self._agent_done("deploy")
 
         return deploy_output, branch_name, git_error, pr_data
 

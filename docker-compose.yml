@@ -32,6 +32,16 @@ services:
       timeout: 5s
       retries: 10
 
+  redisinsight:
+    image: redis/redisinsight:latest
+    ports:
+      - "5540:5540"
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - tools   # Only starts with: docker compose --profile tools up
+
   # ── Application ─────────────────────────────────────────────────────────────
 
   api:
@@ -68,7 +78,7 @@ services:
       api:
         condition: service_started
     volumes:
-      # Shared volume — worker clones the Go repo here
+      # Per-task subdirectories are created under this path
       - git_repos:/tmp/ia-squad-repo
     restart: unless-stopped
 

@@ -6,15 +6,17 @@ Responsabilidades:
   2. Executar o Orchestrator (DevAgent → ReviewerAgent → GitService)
   3. Atualizar o progresso em tempo real no Redis
   4. Notificar o usuário no Telegram ao concluir (sucesso ou falha)
+  5. Criar subtasks no Jira por agente, atualizar status e time tracking
 
 Executa em loop infinito como processo separado do FastAPI.
 """
 import logging
 import time
+from datetime import datetime, timezone
 
 import httpx
 
-from app.core.config import settings
+from app.core.config import settings, validate_required_settings
 from app.core.database import SessionLocal
 from app.core.redis_client import dequeue_task, get_progress, set_progress
 from app.models.task import TaskStatus
@@ -110,16 +112,29 @@ def _get_jira() -> JiraService:
     return _jira
 
 
-def _notify_jira_success(jira_issue_key: str, task_id: int, result: dict) -> None:
-    """Post pipeline results as a Jira comment and transition to Done."""
+def _notify_jira_success(
+    jira_issue_key: str, task_id: int, result: dict,
+    started_at: datetime | None = None,
+) -> None:
+    """Post pipeline results as a Jira comment, transition Em Analise → Done."""
     jira = _get_jira()
     if not jira.is_configured():
         return
 
     try:
-        jira.comment_pipeline_result(jira_issue_key, result)
-        jira.transition_issue(jira_issue_key, settings.JIRA_STATUS_DONE)
-        logger.info(f"[Task {task_id}] Jira {jira_issue_key} updated and transitioned to Done.")
+        jira.comment_pipeline_result(jira_issue_key, result, started_at=started_at)
+
+        # Try intermediate status "Em Analise" (optional — may not exist in all boards)
+        review_ok = jira.transition_issue(jira_issue_key, settings.JIRA_STATUS_REVIEW)
+        if not review_ok:
+            logger.info(f"[Task {task_id}] Jira review status skipped (not available in workflow).")
+
+        # Transition to Done (tries from whatever current status is)
+        done_ok = jira.transition_issue(jira_issue_key, settings.JIRA_STATUS_DONE)
+        if done_ok:
+            logger.info(f"[Task {task_id}] Jira {jira_issue_key} transitioned to Done.")
+        else:
+            logger.warning(f"[Task {task_id}] Jira {jira_issue_key} could not transition to Done.")
     except Exception as exc:
         logger.warning(f"[Task {task_id}] Jira notification failed: {exc}")
 
@@ -141,6 +156,8 @@ def _notify_jira_failure(jira_issue_key: str, task_id: int, error: str) -> None:
 
 def process_task(task_id: int) -> None:
     db = SessionLocal()
+    started_at = datetime.now(timezone.utc)
+
     try:
         task_service = TaskService(db)
         task = task_service.get(task_id)
@@ -156,7 +173,26 @@ def process_task(task_id: int) -> None:
         logger.info(f"[Task {task_id}] Starting execution...")
         set_progress(task_id, "running", "Iniciando agentes...")
 
-        orchestrator = Orchestrator(db)
+        # ── Jira setup: assign, comment start, create subtasks ──
+        jira = _get_jira()
+        jira_key = task.jira_issue_key
+        if jira_key and jira.is_configured():
+            jira.assign_issue(jira_key)
+            jira.comment_start(jira_key)
+            jira.create_agent_subtasks(jira_key)
+
+        # ── Build Orchestrator with Jira callbacks ──
+        on_complete = None
+        on_fail = None
+        if jira_key and jira.is_configured():
+            on_complete = jira.complete_subtask
+            on_fail = jira.fail_subtask
+
+        orchestrator = Orchestrator(
+            db,
+            on_agent_complete=on_complete,
+            on_agent_fail=on_fail,
+        )
         result = orchestrator.execute(task_id)
 
         set_progress(task_id, "completed", "Finalizado com sucesso.")
@@ -167,8 +203,8 @@ def process_task(task_id: int) -> None:
             _notify_success(task.telegram_chat_id, task_id, result)
 
         # ── Notify Jira ──
-        if task.jira_issue_key:
-            _notify_jira_success(task.jira_issue_key, task_id, result)
+        if jira_key:
+            _notify_jira_success(jira_key, task_id, result, started_at=started_at)
 
     except Exception as exc:
         logger.exception(f"[Task {task_id}] Execution failed: {exc}")
@@ -192,6 +228,8 @@ def process_task(task_id: int) -> None:
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    validate_required_settings()
+
     logger.info("=" * 60)
     logger.info("IA Dev Squad — Worker started.")
     logger.info("Waiting for tasks on the Redis queue...")

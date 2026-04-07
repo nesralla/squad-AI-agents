@@ -6,7 +6,15 @@
       "Bash(curl -s http://localhost:8000/jira/status)",
       "Bash(curl -s -X POST http://localhost:8000/jira/sync)",
       "Bash(curl -s -X POST http://localhost:8000/tasks -H \"Content-Type: application/json\" -d '{\"\"description\"\": \"\"[DEV-42] Criar endpoint de health check em Go\"\", \"\"jira_issue_key\"\": \"\"DEV-42\"\", \"\"jira_issue_url\"\": \"\"https://test.atlassian.net/browse/DEV-42\"\", \"\"jira_project_key\"\": \"\"DEV\"\"}')",
-      "Bash(curl -s http://localhost:8000/tasks/4)"
+      "Bash(curl -s http://localhost:8000/tasks/4)",
+      "Bash(find . -name \"*.py\" -exec grep -l \"except.*pass\\\\|except.*:\" {} \\\\;)",
+      "Bash([ -f \"$dir/__init__.py\" ])",
+      "Read(//def _phase_tests/,/^    def [^_]/**)",
+      "Bash(grep -B 2 \"json.loads\" /Users/igornesrallaribeiro/Documents/Projetos/Apps/IADevAgentsSquad/squad-AI-agents/app/agents/*.py)",
+      "Bash(pip freeze:*)",
+      "Bash(pip3 freeze:*)",
+      "Bash(docker run:*)",
+      "Bash(grep -l \"def _extract_json\\\\|def _try_repair_json\" app/agents/*.py)"
     ]
   }
 }

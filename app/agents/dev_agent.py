@@ -1,13 +1,13 @@
 import json
 import logging
-import re
 
 from app.agents.base_agent import BaseAgent
 
 logger = logging.getLogger(__name__)
 
-# 16k tokens — enough for CRUD tasks with 10+ files
-_DEFAULT_MAX_TOKENS = 16_000
+# Max tokens for code generation. The fix() method sends the full previous code
+# + feedback as input, so the response needs enough room for the full re-generation.
+_DEFAULT_MAX_TOKENS = 32_000
 
 DEV_SYSTEM_PROMPT = """Voce e um desenvolvedor backend senior especializado em GoLang.
 Sua funcao e implementar codigo de alta qualidade baseado nos requisitos fornecidos.
@@ -55,62 +55,6 @@ Retorne o JSON completo com TODOS os arquivos (incluindo os que nao mudaram), no
 """
 
 
-def _try_repair_json(raw: str) -> dict | None:
-    """
-    Attempt to repair truncated JSON from LLM output.
-    Common case: output was cut off mid-string inside the files array.
-    """
-    # Find the start of the JSON object
-    start = raw.find("{")
-    if start == -1:
-        return None
-
-    text = raw[start:]
-
-    # Try progressively aggressive truncation repairs
-    repairs = [
-        text,                          # as-is
-        text + '"}]}',                 # close string + array + object
-        text + '"}], "summary": "truncated", "dependencies": [], "notes": ""}',
-    ]
-
-    for attempt in repairs:
-        try:
-            return json.loads(attempt)
-        except json.JSONDecodeError:
-            continue
-
-    return None
-
-
-def _extract_json(raw: str) -> dict:
-    """Extract a JSON object from LLM output, handling markdown fences and truncation."""
-    # Try markdown fenced block first
-    json_match = re.search(r"```(?:json)?\s*(\{.+\})\s*```", raw, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    # Try raw JSON object
-    obj_match = re.search(r"\{.+\}", raw, re.DOTALL)
-    if obj_match:
-        try:
-            return json.loads(obj_match.group())
-        except json.JSONDecodeError:
-            pass
-
-    # Try to repair truncated output
-    logger.warning("DevAgent JSON parsing failed, attempting repair...")
-    repaired = _try_repair_json(raw)
-    if repaired and repaired.get("files"):
-        logger.info(f"JSON repair succeeded — {len(repaired['files'])} file(s) recovered.")
-        return repaired
-
-    raise ValueError(f"DevAgent returned non-JSON response:\n{raw[:500]}")
-
-
 class DevAgent(BaseAgent):
     def __init__(self):
         super().__init__("DevAgent", DEV_SYSTEM_PROMPT)
@@ -130,7 +74,7 @@ class DevAgent(BaseAgent):
         else:
             prompt = task_description
         raw = super().run(prompt, max_tokens)
-        return _extract_json(raw)
+        return self.extract_json(raw, "DevAgent")
 
     def fix(
         self,
@@ -146,7 +90,7 @@ class DevAgent(BaseAgent):
             feedback=feedback,
         )
         raw = super().run(prompt, max_tokens)
-        return _extract_json(raw)
+        return self.extract_json(raw, "DevAgent")
 
     # Keep backwards compatibility
     def run(self, task_description: str, max_tokens: int = _DEFAULT_MAX_TOKENS) -> dict:

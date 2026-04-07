@@ -1,5 +1,4 @@
 import json
-import re
 
 from app.agents.base_agent import BaseAgent
 
@@ -48,13 +47,4 @@ class ReviewerAgent(BaseAgent):
         )
         prompt = "\n".join(parts)
         raw = super().run(prompt, max_tokens)
-
-        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
-        if json_match:
-            return json.loads(json_match.group(1))
-
-        obj_match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if obj_match:
-            return json.loads(obj_match.group())
-
-        raise ValueError(f"ReviewerAgent returned non-JSON response:\n{raw[:500]}")
+        return self.extract_json(raw, "ReviewerAgent")

@@ -4,11 +4,12 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
+from app.core.config import settings, validate_required_settings
 from app.core.database import get_db, init_db
 from app.core.redis_client import enqueue_task, get_progress, queue_length
 from app.schemas.task_schema import TaskProgressResponse, TaskQueuedResponse, TaskRequest, TaskResponse
 from app.models.memory import AgentMemory  # noqa: F401 — register model for create_all
+from app.models.task import Task, TaskStatus
 from app.services.jira_service import JiraService
 from app.services.task_service import TaskService
 
@@ -16,6 +17,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+
+# Validate required env vars before anything else
+validate_required_settings()
 
 # Enable pgvector extension and create tables on startup
 init_db()
@@ -157,4 +161,79 @@ def jira_sync(db: DbDep):
         "synced": len(created),
         "issues_found": len(issues),
         "tasks_created": created,
+    }
+
+
+@app.post("/jira/fix-status")
+def jira_fix_status(db: DbDep):
+    """
+    Find completed/failed tasks whose Jira issues are still stuck
+    (e.g. in 'Em andamento') and transition them to Done.
+    """
+    jira = JiraService()
+    if not jira.is_configured():
+        raise HTTPException(status_code=400, detail="Jira is not configured.")
+
+    task_service = TaskService(db)
+    stuck = (
+        db.query(Task)
+        .filter(
+            Task.jira_issue_key.isnot(None),
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        )
+        .all()
+    )
+
+    fixed = []
+    for task in stuck:
+        target = (
+            settings.JIRA_STATUS_DONE
+            if task.status == TaskStatus.COMPLETED
+            else settings.JIRA_STATUS_IN_PROGRESS  # failed stays in progress for retry
+        )
+
+        if task.status == TaskStatus.COMPLETED:
+            ok = jira.transition_issue(task.jira_issue_key, target)
+            if ok:
+                fixed.append({"task_id": task.id, "jira_key": task.jira_issue_key, "transitioned_to": target})
+
+    return {
+        "checked": len(stuck),
+        "fixed": len(fixed),
+        "details": fixed,
+    }
+
+
+@app.get("/jira/debug/{issue_key}")
+def jira_debug_transitions(issue_key: str):
+    """Show available transitions for a Jira issue — useful for debugging status names."""
+    jira = JiraService()
+    if not jira.is_configured():
+        raise HTTPException(status_code=400, detail="Jira is not configured.")
+
+    import httpx as _httpx
+    resp = _httpx.get(
+        f"{jira.base_url}/rest/api/3/issue/{issue_key}/transitions",
+        headers=jira._headers(),
+        timeout=30.0,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
+
+    transitions = resp.json().get("transitions", [])
+    return {
+        "issue_key": issue_key,
+        "current_config": {
+            "JIRA_STATUS_DONE": settings.JIRA_STATUS_DONE,
+            "JIRA_STATUS_IN_PROGRESS": settings.JIRA_STATUS_IN_PROGRESS,
+            "JIRA_STATUS_REVIEW": settings.JIRA_STATUS_REVIEW,
+        },
+        "available_transitions": [
+            {
+                "id": t["id"],
+                "transition_name": t["name"],
+                "target_status": t.get("to", {}).get("name", "?"),
+            }
+            for t in transitions
+        ],
     }

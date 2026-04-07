@@ -25,6 +25,9 @@ class Settings:
     # API internal URL used by the telegram bot
     API_BASE_URL: str = os.getenv("API_BASE_URL", "http://api:8000")
 
+    # LLM model
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "claude-haiku-4-5-20251001")
+
     # Memory / Embeddings (Phase 3)
     VOYAGE_API_KEY: str = os.getenv("VOYAGE_API_KEY", "")
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "voyage-code-3")
@@ -39,8 +42,26 @@ class Settings:
     JIRA_POLL_INTERVAL: int = int(os.getenv("JIRA_POLL_INTERVAL", "60"))  # seconds
     JIRA_STATUS_TODO: str = os.getenv("JIRA_STATUS_TODO", "To Do")
     JIRA_STATUS_IN_PROGRESS: str = os.getenv("JIRA_STATUS_IN_PROGRESS", "In Progress")
+    JIRA_STATUS_REVIEW: str = os.getenv("JIRA_STATUS_REVIEW", "Em Analise")
     JIRA_STATUS_DONE: str = os.getenv("JIRA_STATUS_DONE", "Done")
     JIRA_LABEL_TRIGGER: str = os.getenv("JIRA_LABEL_TRIGGER", "ai-squad")  # label that triggers processing
+    JIRA_ASSIGNEE_ACCOUNT_ID: str = os.getenv("JIRA_ASSIGNEE_ACCOUNT_ID", "")  # Atlassian account ID for the bot user
 
 
 settings = Settings()
+
+
+def validate_required_settings() -> None:
+    """Validate that critical environment variables are set. Call on startup."""
+    missing = []
+    if not settings.ANTHROPIC_API_KEY:
+        missing.append("ANTHROPIC_API_KEY")
+    if not settings.DATABASE_URL:
+        missing.append("DATABASE_URL")
+    if not settings.REDIS_URL:
+        missing.append("REDIS_URL")
+    if missing:
+        raise RuntimeError(
+            f"Missing required environment variables: {', '.join(missing)}. "
+            f"Check your .env file."
+        )

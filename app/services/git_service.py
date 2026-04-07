@@ -13,7 +13,8 @@ logger = logging.getLogger(__name__)
 
 class GitService:
     def __init__(self):
-        self.repo_path = Path(settings.GIT_REPO_PATH)
+        self.base_repo_path = Path(settings.GIT_REPO_PATH)
+        self.repo_path = self.base_repo_path  # overridden per-task in execute_task
         self.repo_url = settings.GIT_REPO_URL
         self.main_branch = settings.GIT_MAIN_BRANCH
 
@@ -138,12 +139,29 @@ class GitService:
         files: list[dict],
         summary: str,
     ) -> str:
-        """Full pipeline: setup -> branch -> write -> commit -> push. Returns branch name."""
-        self.setup_repo()
-        branch_name = self.create_branch(task_id, task_description)
-        self.write_files(files)
-        self.commit_and_push(branch_name, task_id, summary)
-        return branch_name
+        """Full pipeline: setup -> branch -> write -> commit -> push. Returns branch name.
+
+        Each task gets its own isolated repo directory under base_repo_path to
+        avoid race conditions when multiple workers process tasks concurrently.
+        """
+        task_repo_path = self.base_repo_path / f"task-{task_id}"
+        self.repo_path = task_repo_path
+
+        try:
+            self.setup_repo()
+            branch_name = self.create_branch(task_id, task_description)
+            self.write_files(files)
+            self.commit_and_push(branch_name, task_id, summary)
+            return branch_name
+        finally:
+            # Cleanup: remove per-task clone to save disk space
+            try:
+                if task_repo_path.exists():
+                    shutil.rmtree(task_repo_path, ignore_errors=True)
+                    logger.info(f"[Task {task_id}] Cleaned up repo at {task_repo_path}")
+            except Exception as cleanup_exc:
+                logger.warning(f"[Task {task_id}] Repo cleanup failed: {cleanup_exc}")
+            self.repo_path = self.base_repo_path
 
     # ------------------------------------------------------------------
     # Pull Request creation via GitHub API

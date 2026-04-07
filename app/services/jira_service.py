@@ -3,9 +3,10 @@ Jira Cloud Service — REST API client for bidirectional integration.
 
 Responsibilities:
   1. Fetch issues from a Jira project (filtered by label + status)
-  2. Transition issue status (To Do → In Progress → Done)
+  2. Transition issue status (To Do → In Progress → Em Analise → Done)
   3. Add comments with pipeline results (code review, PR link, security scan)
-  4. Update custom fields (branch name, PR URL)
+  4. Create subtasks for each agent phase
+  5. Assign issue and track start time / duration
 
 Authentication: Atlassian API Token (Basic Auth with email:token).
 API Docs: https://developer.atlassian.com/cloud/jira/platform/rest/v3/
@@ -13,6 +14,7 @@ API Docs: https://developer.atlassian.com/cloud/jira/platform/rest/v3/
 import base64
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -23,6 +25,17 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT = 30.0
 
+# Maps orchestrator steps to human-readable subtask summaries
+AGENT_SUBTASKS = [
+    ("planner", "Planejamento — decomposicao da tarefa"),
+    ("architect", "Arquitetura — definicao de estrutura e padroes"),
+    ("dev_agent", "Geracao de Codigo — implementacao GoLang"),
+    ("security", "Security Scan — analise de vulnerabilidades"),
+    ("reviewer", "Code Review — revisao de qualidade"),
+    ("test_agent", "Testes — geracao e validacao de testes"),
+    ("deploy", "Deploy & PR — artefatos e pull request"),
+]
+
 
 class JiraService:
     """Client for Jira Cloud REST API v3."""
@@ -32,6 +45,7 @@ class JiraService:
         self.project_key = settings.JIRA_PROJECT_KEY
         self.label_trigger = settings.JIRA_LABEL_TRIGGER
         self._auth_header = self._build_auth_header()
+        self._subtask_keys: dict[str, str] = {}  # step_name -> subtask issue key
 
     def _build_auth_header(self) -> str:
         """Build Basic Auth header from email:token."""
@@ -182,15 +196,27 @@ class JiraService:
                 return False
 
             transitions = resp.json().get("transitions", [])
+
+            # Match by transition name OR by target status name
+            # (Jira transition names often differ from status names,
+            #  e.g. transition "Concluir" → status "Concluido")
+            target_lower = target_status.lower()
             target = next(
-                (t for t in transitions if t["name"].lower() == target_status.lower()),
+                (
+                    t for t in transitions
+                    if t["name"].lower() == target_lower
+                    or t.get("to", {}).get("name", "").lower() == target_lower
+                ),
                 None,
             )
             if not target:
-                available = [t["name"] for t in transitions]
+                available = [
+                    f"{t['name']} → {t.get('to', {}).get('name', '?')}"
+                    for t in transitions
+                ]
                 logger.warning(
-                    f"Jira transition '{target_status}' not found for {issue_key}. "
-                    f"Available: {available}"
+                    f"Jira transition to '{target_status}' not found for {issue_key}. "
+                    f"Available transitions: {available}"
                 )
                 return False
 
@@ -212,6 +238,132 @@ class JiraService:
         except Exception as exc:
             logger.warning(f"Jira transition failed for {issue_key}: {exc}")
             return False
+
+    # ------------------------------------------------------------------
+    # Assignee
+    # ------------------------------------------------------------------
+
+    def assign_issue(self, issue_key: str, account_id: str = "") -> bool:
+        """Assign a Jira issue to a user by Atlassian account ID."""
+        if not self.is_configured():
+            return False
+
+        aid = account_id or settings.JIRA_ASSIGNEE_ACCOUNT_ID
+        if not aid:
+            logger.debug(f"No JIRA_ASSIGNEE_ACCOUNT_ID configured — skipping assign for {issue_key}.")
+            return False
+
+        try:
+            resp = httpx.put(
+                self._api_url(f"issue/{issue_key}/assignee"),
+                headers=self._headers(),
+                json={"accountId": aid},
+                timeout=_TIMEOUT,
+            )
+            if resp.status_code == 204:
+                logger.info(f"Jira: {issue_key} assigned to {aid}.")
+                return True
+            logger.warning(f"Jira assign failed ({resp.status_code}): {resp.text[:200]}")
+            return False
+        except Exception as exc:
+            logger.warning(f"Jira assign failed for {issue_key}: {exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Subtasks
+    # ------------------------------------------------------------------
+
+    def create_subtask(self, parent_key: str, summary: str) -> str | None:
+        """
+        Create a subtask under a parent issue.
+
+        Returns the new subtask key (e.g. 'PROJ-42') or None on failure.
+        """
+        if not self.is_configured():
+            return None
+
+        payload = {
+            "fields": {
+                "project": {"key": self.project_key},
+                "parent": {"key": parent_key},
+                "summary": summary,
+                "issuetype": {"name": "Subtask"},
+            }
+        }
+
+        try:
+            resp = httpx.post(
+                self._api_url("issue"),
+                headers=self._headers(),
+                json=payload,
+                timeout=_TIMEOUT,
+            )
+            if resp.status_code == 201:
+                key = resp.json().get("key", "")
+                logger.info(f"Jira: Subtask {key} created under {parent_key}: {summary}")
+                return key
+
+            # Some projects use "Sub-task" instead of "Subtask"
+            if resp.status_code == 400 and "issuetype" in resp.text.lower():
+                payload["fields"]["issuetype"]["name"] = "Sub-task"
+                resp = httpx.post(
+                    self._api_url("issue"),
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=_TIMEOUT,
+                )
+                if resp.status_code == 201:
+                    key = resp.json().get("key", "")
+                    logger.info(f"Jira: Subtask {key} created under {parent_key}: {summary}")
+                    return key
+
+            logger.warning(f"Jira subtask creation failed ({resp.status_code}): {resp.text[:300]}")
+            return None
+        except Exception as exc:
+            logger.warning(f"Jira subtask creation failed for {parent_key}: {exc}")
+            return None
+
+    def create_agent_subtasks(self, parent_key: str) -> dict[str, str]:
+        """
+        Create all agent phase subtasks under a parent issue.
+
+        Returns a dict mapping step_name -> subtask_key.
+        """
+        self._subtask_keys = {}
+        for step_name, summary in AGENT_SUBTASKS:
+            key = self.create_subtask(parent_key, summary)
+            if key:
+                self._subtask_keys[step_name] = key
+        return self._subtask_keys
+
+    def complete_subtask(self, step_name: str) -> bool:
+        """Transition a subtask to Done by its step name."""
+        subtask_key = self._subtask_keys.get(step_name)
+        if not subtask_key:
+            return False
+        return self.transition_issue(subtask_key, settings.JIRA_STATUS_DONE)
+
+    def fail_subtask(self, step_name: str) -> bool:
+        """Mark a subtask step as failed via comment (stays in current status)."""
+        subtask_key = self._subtask_keys.get(step_name)
+        if not subtask_key:
+            return False
+        return self.add_comment(subtask_key, "Este passo falhou durante a execucao do pipeline.")
+
+    # ------------------------------------------------------------------
+    # Time tracking
+    # ------------------------------------------------------------------
+
+    def comment_start(self, issue_key: str) -> bool:
+        """Post a comment marking the pipeline start time."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        body = (
+            f"=== IA Dev Squad — Pipeline Iniciado ===\n\n"
+            f"Inicio: {now}\n"
+            f"Agente responsavel: IA Dev Squad (automacao)\n"
+            f"Pipeline de 7 agentes em execucao..."
+        )
+        return self.add_comment(issue_key, body)
 
     # ------------------------------------------------------------------
     # Comments
@@ -255,7 +407,9 @@ class JiraService:
             logger.warning(f"Jira comment failed for {issue_key}: {exc}")
             return False
 
-    def comment_pipeline_result(self, issue_key: str, result: dict) -> bool:
+    def comment_pipeline_result(
+        self, issue_key: str, result: dict, started_at: datetime | None = None
+    ) -> bool:
         """Format and post the full pipeline result as a Jira comment."""
         review = result.get("review", {})
         security = result.get("security", {})
@@ -264,8 +418,20 @@ class JiraService:
         pr_line = f"PR: {result['pr_url']}" if result.get("pr_url") else ""
         branch_line = f"Branch: {result.get('branch', 'N/A')}"
 
+        # Duration
+        duration_line = ""
+        if started_at:
+            elapsed = datetime.now(timezone.utc) - started_at
+            minutes = int(elapsed.total_seconds() // 60)
+            seconds = int(elapsed.total_seconds() % 60)
+            duration_line = f"Duracao: {minutes}m {seconds}s\n"
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
         body = (
             f"=== IA Dev Squad — Pipeline Completo ===\n\n"
+            f"Finalizado em: {now}\n"
+            f"{duration_line}"
             f"{pr_line or branch_line}\n"
             f"Implementacao: {result.get('dev_summary', 'N/A')}\n\n"
             f"--- Pipeline (7 agentes) ---\n"

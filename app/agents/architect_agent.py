@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 
 from app.agents.base_agent import BaseAgent
 
@@ -60,24 +59,6 @@ Formato de resposta OBRIGATORIO — retorne APENAS um JSON valido, sem texto ant
 """
 
 
-def _extract_json(raw: str) -> dict:
-    json_match = re.search(r"```(?:json)?\s*(\{.+?\})\s*```", raw, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    obj_match = re.search(r"\{.+\}", raw, re.DOTALL)
-    if obj_match:
-        try:
-            return json.loads(obj_match.group())
-        except json.JSONDecodeError:
-            pass
-
-    raise ValueError(f"ArchitectAgent returned non-JSON response:\n{raw[:500]}")
-
-
 class ArchitectAgent(BaseAgent):
     def __init__(self):
         super().__init__("ArchitectAgent", ARCHITECT_SYSTEM_PROMPT)
@@ -102,4 +83,4 @@ class ArchitectAgent(BaseAgent):
         )
         prompt = "\n".join(parts)
         raw = super().run(prompt, max_tokens)
-        return _extract_json(raw)
+        return self.extract_json(raw, "ArchitectAgent")

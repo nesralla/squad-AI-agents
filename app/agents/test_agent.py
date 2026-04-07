@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 
 from app.agents.base_agent import BaseAgent
 
@@ -59,49 +58,6 @@ Retorne o JSON completo com TODOS os arquivos de teste, no mesmo formato obrigat
 """
 
 
-def _try_repair_json(raw: str) -> dict | None:
-    start = raw.find("{")
-    if start == -1:
-        return None
-
-    text = raw[start:]
-    repairs = [
-        text,
-        text + '"}]}',
-        text + '"}], "coverage_estimate": "unknown", "test_count": 0, "scenarios_covered": [], "notes": "truncated"}',
-    ]
-    for attempt in repairs:
-        try:
-            return json.loads(attempt)
-        except json.JSONDecodeError:
-            continue
-    return None
-
-
-def _extract_json(raw: str) -> dict:
-    json_match = re.search(r"```(?:json)?\s*(\{.+?\})\s*```", raw, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    obj_match = re.search(r"\{.+\}", raw, re.DOTALL)
-    if obj_match:
-        try:
-            return json.loads(obj_match.group())
-        except json.JSONDecodeError:
-            pass
-
-    logger.warning("TestAgent JSON parsing failed, attempting repair...")
-    repaired = _try_repair_json(raw)
-    if repaired and repaired.get("test_files"):
-        logger.info(f"JSON repair succeeded — {len(repaired['test_files'])} test file(s) recovered.")
-        return repaired
-
-    raise ValueError(f"TestAgent returned non-JSON response:\n{raw[:500]}")
-
-
 class TestAgent(BaseAgent):
     def __init__(self):
         super().__init__("TestAgent", TEST_SYSTEM_PROMPT)
@@ -128,7 +84,7 @@ class TestAgent(BaseAgent):
 
         prompt = "\n".join(parts)
         raw = super().run(prompt, max_tokens)
-        return _extract_json(raw)
+        return self.extract_json(raw, "TestAgent")
 
     def fix_tests(
         self,
@@ -144,4 +100,4 @@ class TestAgent(BaseAgent):
             errors=errors,
         )
         raw = super().run(prompt, max_tokens)
-        return _extract_json(raw)
+        return self.extract_json(raw, "TestAgent")

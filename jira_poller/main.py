@@ -15,7 +15,7 @@ import time
 
 import httpx
 
-from app.core.config import settings
+from app.core.config import settings, validate_required_settings
 from app.core.database import SessionLocal
 from app.core.redis_client import enqueue_task
 from app.schemas.task_schema import TaskRequest
@@ -83,6 +83,7 @@ def poll_jira_once(jira: JiraService) -> int:
 
 
 def main() -> None:
+    validate_required_settings()
     jira = JiraService()
 
     if not jira.is_configured():
